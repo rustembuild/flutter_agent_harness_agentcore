@@ -201,7 +201,7 @@ MarkStarted → DevLeg → ReviewLeg → Choice(verdict)
 |---|---|
 | `rustembuild/dmtools-agentic-workflows` (fork, never PR'd) | `run-leg.sh` extraction, executor switch in `factory-teammate.yml`, `wait-agentcore-leg` step, cache backend switch |
 | `rustembuild/dmtools-agents` (fork, never PR'd) | `executor` key in `configLoader.js`, LegSpec/LegResult schemas, unit tests |
-| `rustembuild/dark-factory-aws` (new) | leg-runner Dockerfile + shim; CDK (TypeScript): ECR, AgentCore Runtime, S3, Secrets, IAM + OIDC provider, Budgets, Step Functions, Lambdas, API Gateway + WAF |
+| `rustembuild/dark-factory-aws` (new) | leg-runner Dockerfile + shim (Python); Terraform applied only through GitHub Actions: ECR, AgentCore Runtime, S3, Secrets, IAM, Budgets, Step Functions, Lambdas, API Gateway + WAF |
 | `rustembuild/flutter_agent_harness_agentcore` (this fork) | first test consumer: `uses:` → own fork, the config line, `agentcore` environment |
 | new canary repo (snake game) | throwaway web app to shake out the factory, set up via the setup-dark-factory runbook |
 | new app repo (cinema booking) | the assessment app, same setup |
@@ -210,7 +210,42 @@ Fork hygiene: changes go mostly into new files with small hook points in
 existing ones; consumers pin `uses:` to a fork commit SHA (not `@main`);
 weekly `git merge upstream/main` into the forks.
 
-## 6. Security — public repo, private AWS bill
+## 6. Shared AWS account — never touch df-agentcore
+
+The AWS account (its ID is kept out of public repos and passed via
+variables) already hosts the owner's earlier dark factory, `df-agentcore`
+(eu-central-1; tag `Project=df-agentcore`; names `darkfactory-*`,
+`df-agentcore-*`; CI role `GitHubActionsRole`; Terraform state in
+`df-agentcore-state-<account>`). This project must not change or depend on
+any of it beyond reading the shared GitHub OIDC provider.
+
+- **Region fence:** everything regional lives in **us-east-1**; df-agentcore
+  is entirely in eu-central-1.
+- **Names and tags:** every resource is prefixed `fa-ac-` (`fa_ac_` where
+  AWS forbids hyphens) and tagged `Project=fa-agentcore` through provider
+  `default_tags`. IAM roles and policies live under path `/fa-ac/`.
+- **Shared OIDC provider:** AWS allows one per URL per account; df-agentcore
+  created it. This project only **reads** it (Terraform `data` source) and
+  never manages it.
+- **Own state:** Terraform state in a new bucket `fa-ac-state-<account>`
+  (us-east-1, versioned, S3-native lock). Never df-agentcore's bucket.
+- **Own CI role `fa-ac-ci`, not AdministratorAccess:** allowed only in
+  us-east-1 for regional services; IAM only under `/fa-ac/` and every role
+  it creates must carry the `fa-ac-boundary` permissions boundary; explicit
+  Deny on resources tagged `Project=df-agentcore`, on names `darkfactory-*`,
+  `df-agentcore-*`, `GitHubActionsRole`, and on eu-central-1.
+- **Terraform through GitHub Actions only**, matching df-agentcore's rule —
+  except the one-time bootstrap (state bucket + `fa-ac-ci` role), which the
+  owner applies locally once with admin credentials because CI cannot create
+  its own role. It touches no df-agentcore resource.
+- **Budget scoped by tag:** the account budget would count df-agentcore's
+  spend, so the $20 alert / $50 stop budget filters on cost allocation tag
+  `Project=fa-agentcore` (the owner activates the tag once in Billing).
+  The hard stop attaches deny-all only to this project's roles.
+- **Teardown** destroys only this project's state; `prevent_destroy` stays
+  on the state bucket.
+
+## 7. Security — public repo, private AWS bill
 
 Assume any agent session can be fully taken over by prompt injection.
 
@@ -223,8 +258,7 @@ Assume any agent session can be fully taken over by prompt injection.
    `repo:rustembuild/flutter_agent_harness_agentcore:environment:agentcore`
    (and the app repo's equivalent). The `agentcore` environment is limited to
    `main`, optionally with required reviewer.
-3. **Blast radius:** a dedicated AWS account in the owner's Organization.
-   Execution role: read 3 named secrets, write its S3 prefix and log group,
+3. **Blast radius:** the shared-account fences of §6. Execution role: read 3 named secrets, write its S3 prefix and log group,
    `states:SendTaskSuccess/Failure` — nothing else. GitHub token: fine-grained,
    single repo, no admin, `main` protected. LLM keys with provider spend caps.
 4. **Spend caps:** max 2 concurrent legs, max N legs/day, runtime
@@ -236,7 +270,7 @@ Assume any agent session can be fully taken over by prompt injection.
 6. **Webhook (phase 2):** verify GitHub HMAC signature, then repo and sender
    allowlist, before any execution starts; WAF rate limit.
 
-## 7. Testing
+## 8. Testing
 
 - **Refactor parity:** same canary issue through the `inline` executor before
   and after extracting `run-leg.sh`; existing dmtools-agents unit tests pass;
@@ -245,17 +279,19 @@ Assume any agent session can be fully taken over by prompt injection.
   `/ping` states, accept + background run, `result.json` written, task-token
   callback against a stub.
 - **Contract:** both sides validate against the shared schemas.
+- **Infrastructure:** `terraform test` with mocked providers in CI asserts
+  trust subjects, the shared-account fences (§6) and budget values.
 - **Security negatives:** fork / PR OIDC subject denied (IAM policy
   simulator); bad webhook signature and non-allowlisted sender dropped;
   budget action attaches deny; kill switch stops new legs.
 - **E2E:** a canary issue through dev → review → rework → merge on each
   orchestrator.
 
-## 8. Milestones (~5 weeks)
+## 9. Milestones (~5 weeks)
 
 | | Milestone | Done when |
 |---|---|---|
-| M0 | AWS sandbox account, OIDC, budget, kill switch; spike: hand-deployed hello-world shim | cold start measured, limits confirmed |
+| M0 | Bootstrap in the shared account, fenced CI role, budget, kill switch; hello-world shim deployed through CI | cold start measured, limits confirmed, df-agentcore unchanged |
 | M1 | `run-leg.sh` extracted in the fork | inline parity canary green |
 | M2 | leg-runner image, agentcore executor, S3 cache | this fork's legs run in AgentCore via the one config line |
 | M3a | canary repo: factory builds a web snake game (GHA orchestrator + AgentCore executor) | issue → merged PR → playable game, no human code |
@@ -263,8 +299,9 @@ Assume any agent session can be fully taken over by prompt injection.
 | M4 | Step Functions orchestrator + webhook bridge | canary loop visible in the console |
 | M5 | metrics (cost/leg, rounds, lead time), hardening, presentation | assessment-ready |
 
-## 9. Decisions
+## 10. Decisions
 
 - Web stack (canary + cinema app): Python FastAPI backend + React (Vite) frontend.
-- AWS region: us-east-1.
+- AWS region: us-east-1 (shared account; df-agentcore stays in eu-central-1).
+- Infrastructure as code: Terraform through GitHub Actions (not CDK), matching df-agentcore.
 - AWS Budgets: alert at $20/month, hard stop (deny-all action) at $50/month.
