@@ -307,3 +307,20 @@ Assume any agent session can be fully taken over by prompt injection.
 - AWS region: us-east-1 (shared account; df-agentcore stays in eu-central-1).
 - Infrastructure as code: Terraform through GitHub Actions (not CDK), matching df-agentcore.
 - AWS Budgets: alert at $20/month, hard stop (deny-all action) at $50/month.
+  Notifications go to the subscriber-less SNS topic `fa-ac-budget` (owner
+  choice 2026-10-09: no alert email; the stop acts on its own).
+- All Terraform, the bootstrap included, applies through CI (`deploy.yml`:
+  bootstrap → foundation → image → runtime). The bootstrap runs as
+  `fa-ac-bootstrap`, which cannot change itself; changing that role is the
+  only local owner apply left.
+- Public repos: `main` is pull-request-only, outside contributors' workflow
+  runs need approval, interaction limits stay at collaborators-only
+  (renewed every 6 months), secret scanning + push protection are on.
+- App repos (M3a snake, M3b cinema) are private: only the owner can file or
+  comment on the issues agents read. Agents still run only for allowlisted
+  assigners/authors and read only allowlisted comments (M1 requirement).
+- Conventions: Conventional Commits; org-wide PR template and `.gitmessage`
+  in the public `rustembuild/.github`; PR titles checked in CI; semantic
+  releases (tag + notes, nothing committed back) in our own repos —
+  dark-factory-aws now, the app repos from M3a. The fa fork keeps
+  upstream's release pipeline.
