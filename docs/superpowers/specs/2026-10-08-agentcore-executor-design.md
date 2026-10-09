@@ -26,8 +26,10 @@ runner VM inside `factory-teammate.yml`. This design adds:
 
 - `executor: 'agentcore'` in a consumer's `.dmtools/config.js` makes its legs
   run in AgentCore; removing it restores today's behaviour exactly.
-- A new app repo is built by the factory end to end (issue → merged PR) with
-  legs executing in AgentCore (milestone M3 — the minimum assessment demo).
+- A throwaway **web snake game** repo is built by the factory end to end
+  (issue → merged PR) with legs executing in AgentCore (M3a — factory canary).
+- The assessment app, a **web-based cinema ticket booking** app, is built by
+  the factory the same way (M3b — the minimum assessment demo).
 - Phase 2: the same loop driven by Step Functions, visible in the console.
 - No one but the owner can cause spend in the owner's AWS account (§6).
 - Metrics per leg: duration, AgentCore cost, LLM tokens, review rounds.
@@ -124,8 +126,9 @@ with `ORCHESTRATOR=stepfunctions` making the GitHub Actions stub exit early.
   `GET /ping` (AgentCore HTTP protocol contract).
 - **Base layer:** a small HTTP shim, git, gh, fa, dmtools CLI, `run-leg.sh`.
   Built and pushed to ECR by CI when fa/dmtools versions change.
-- **Toolchain layer:** per target app (e.g. Flutter for the demo app), so the
-  base stays generic. Total ≤ 2 GB.
+- **Toolchain layer:** per target app, so the base stays generic. For the
+  canary and the cinema app: Python 3.12 + uv (FastAPI backend) and Node LTS
+  (React + Vite frontend). Total ≤ 2 GB.
 
 ### 3.2 Leg lifecycle
 
@@ -200,7 +203,8 @@ MarkStarted → DevLeg → ReviewLeg → Choice(verdict)
 | `rustembuild/dmtools-agents` (fork, never PR'd) | `executor` key in `configLoader.js`, LegSpec/LegResult schemas, unit tests |
 | `rustembuild/dark-factory-aws` (new) | leg-runner Dockerfile + shim; CDK (TypeScript): ECR, AgentCore Runtime, S3, Secrets, IAM + OIDC provider, Budgets, Step Functions, Lambdas, API Gateway + WAF |
 | `rustembuild/flutter_agent_harness_agentcore` (this fork) | first test consumer: `uses:` → own fork, the config line, `agentcore` environment |
-| new app repo | the demo app the factory builds, set up via the setup-dark-factory runbook |
+| new canary repo (snake game) | throwaway web app to shake out the factory, set up via the setup-dark-factory runbook |
+| new app repo (cinema booking) | the assessment app, same setup |
 
 Fork hygiene: changes go mostly into new files with small hook points in
 existing ones; consumers pin `uses:` to a fork commit SHA (not `@main`);
@@ -254,12 +258,16 @@ Assume any agent session can be fully taken over by prompt injection.
 | M0 | AWS sandbox account, OIDC, budget, kill switch; spike: hand-deployed hello-world shim | cold start measured, limits confirmed |
 | M1 | `run-leg.sh` extracted in the fork | inline parity canary green |
 | M2 | leg-runner image, agentcore executor, S3 cache | this fork's legs run in AgentCore via the one config line |
-| **M3** | app repo created; factory builds the app (GHA orchestrator + AgentCore executor) | **minimum assessment demo** |
+| M3a | canary repo: factory builds a web snake game (GHA orchestrator + AgentCore executor) | issue → merged PR → playable game, no human code |
+| **M3b** | app repo: factory builds the web cinema ticket booking app | **minimum assessment demo** |
 | M4 | Step Functions orchestrator + webhook bridge | canary loop visible in the console |
 | M5 | metrics (cost/leg, rounds, lead time), hardening, presentation | assessment-ready |
 
-## 9. Open questions
+## 9. Decisions
 
-- Which app the factory builds (decides the toolchain layer).
-- AgentCore region (us-east-1 / us-west-2 have the highest default quotas).
+- Web stack (canary + cinema app): Python FastAPI backend + React (Vite) frontend.
+- AWS region: us-east-1.
+
+## 10. Open questions
+
 - Budget thresholds $X / $Y.
