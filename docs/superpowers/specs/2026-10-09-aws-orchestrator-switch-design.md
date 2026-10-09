@@ -303,3 +303,15 @@ in aws mode GitHub never calls AgentCore.
   execution, locking and tokens only (owner, 2026-10-09).
 - Leg runner built on IstiN's `run-teammate-local.sh`.
 - CI stays on GitHub Actions in both modes.
+- Coding agent in aws-mode legs: Claude Code on the owner's Claude
+  subscription (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` in the LLM
+  secret), not fa (owner, 2026-10-09). fa's Anthropic adapter is API-key
+  only, and reusing a subscription outside Claude Code is not allowed. A repo
+  picks the agent with `agentProvider: 'fa' | 'claude-code'` in
+  `.dmtools/config.js` (default `fa`); IstiN's packs run unchanged through
+  his `claude-code` provider plus a `claude` shim in the leg image.
+- Target repos need CI: the review verdict labels `pr_approved` only after
+  the PR's checks are green (learned in M1; see dark-factory-aws
+  `docs/m1-findings.md`).
+- Leg-runner base image needs glibc ≥ 2.38 (dmtools' QuickJS library); the
+  image uses `debian:trixie-slim` (learned in M1).
