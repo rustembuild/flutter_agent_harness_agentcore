@@ -238,9 +238,11 @@ any of it beyond reading the shared GitHub OIDC provider.
   except the one-time bootstrap (state bucket + `fa-ac-ci` role), which the
   owner applies locally once with admin credentials because CI cannot create
   its own role. It touches no df-agentcore resource.
-- **Budget scoped by tag:** the account budget would count df-agentcore's
-  spend, so the $20 alert / $50 stop budget filters on cost allocation tag
-  `Project=fa-agentcore` (the owner activates the tag once in Billing).
+- **Budget scoped by region:** the account budget would count df-agentcore's
+  spend, so the $20 alert / $50 stop budget filters on Region `us-east-1`
+  (df-agentcore is entirely eu-central-1; the M0 preflight confirms nothing
+  else spends in us-east-1). A region filter needs no cost-allocation-tag
+  activation and does not depend on AgentCore propagating tags to billing.
   The hard stop attaches deny-all only to this project's roles.
 - **Teardown** destroys only this project's state; `prevent_destroy` stays
   on the state bucket.
