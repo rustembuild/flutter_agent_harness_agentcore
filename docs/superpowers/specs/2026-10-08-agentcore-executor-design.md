@@ -201,7 +201,7 @@ MarkStarted → DevLeg → ReviewLeg → Choice(verdict)
 |---|---|
 | `rustembuild/dmtools-agentic-workflows` (fork, never PR'd) | `run-leg.sh` extraction, executor switch in `factory-teammate.yml`, `wait-agentcore-leg` step, cache backend switch |
 | `rustembuild/dmtools-agents` (fork, never PR'd) | `executor` key in `configLoader.js`, LegSpec/LegResult schemas, unit tests |
-| `rustembuild/dark-factory-aws` (new) | leg-runner Dockerfile + shim (Python); Terraform applied only through GitHub Actions: ECR, AgentCore Runtime, S3, Secrets, IAM, Budgets, Step Functions, Lambdas, API Gateway + WAF |
+| `rustembuild/dark-factory-aws` (new) | leg-runner Dockerfile + shim (Dart, same toolchain as fa; S3 via the aws CLI in the image — Dart has no official AWS SDK); Terraform applied only through GitHub Actions: ECR, AgentCore Runtime, S3, Secrets, IAM, Budgets, Step Functions, Lambdas, API Gateway + WAF |
 | `rustembuild/flutter_agent_harness_agentcore` (this fork) | first test consumer: `uses:` → own fork, the config line, `agentcore` environment |
 | new canary repo (snake game) | throwaway web app to shake out the factory, set up via the setup-dark-factory runbook |
 | new app repo (cinema booking) | the assessment app, same setup |
