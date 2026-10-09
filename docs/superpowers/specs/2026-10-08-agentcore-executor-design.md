@@ -228,8 +228,8 @@ Assume any agent session can be fully taken over by prompt injection.
    `states:SendTaskSuccess/Failure` — nothing else. GitHub token: fine-grained,
    single repo, no admin, `main` protected. LLM keys with provider spend caps.
 4. **Spend caps:** max 2 concurrent legs, max N legs/day, runtime
-   `maxLifetime` = observed longest leg + margin; AWS Budgets alert at $X and
-   a budget action at $Y attaching deny-all to the execution role;
+   `maxLifetime` = observed longest leg + margin; AWS Budgets alert at $50 and
+   a budget action at the hard-stop amount attaching deny-all to the execution role;
    `AGENTCORE_ENABLED=false` kill switch.
 5. **Public logs:** Actions logs are public — the waiting step prints only
    status lines; agent output stays in private CloudWatch.
@@ -267,7 +267,8 @@ Assume any agent session can be fully taken over by prompt injection.
 
 - Web stack (canary + cinema app): Python FastAPI backend + React (Vite) frontend.
 - AWS region: us-east-1.
+- AWS Budgets alert: $50/month.
 
 ## 10. Open questions
 
-- Budget thresholds $X / $Y.
+- Budget hard-stop amount (deny-all action); proposed $100/month.
