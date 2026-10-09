@@ -1,7 +1,7 @@
 # AgentCore executor + Step Functions orchestrator for the fa dark factory
 
 - Date: 2026-10-08
-- Status: design — awaiting review
+- Status: partly superseded (2026-10-09) — Phase 1 (AgentCore executor inside GitHub Actions), Phase 2 (Step Functions orchestrator) and the M1–M5 milestones are replaced by `2026-10-09-aws-orchestrator-switch-design.md`. M0, account isolation (§6), security (§7) and decisions (§10) stay in force.
 - Owner: rustembuild
 
 ## 1. Context and goal
