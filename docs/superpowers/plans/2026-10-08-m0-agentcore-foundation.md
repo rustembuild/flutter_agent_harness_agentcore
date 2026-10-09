@@ -4,9 +4,9 @@
 
 **Goal:** Deploy a hello-world leg runner to Amazon Bedrock AgentCore Runtime in the shared AWS account — fenced away from df-agentcore, budget-capped, deployed by Terraform through GitHub Actions — and prove it end to end from a GitHub workflow in the fa fork.
 
-**Architecture:** A new repo `dark-factory-aws` holds a small Python HTTP shim (the AgentCore `/ping` + `/invocations` contract) that runs `run-leg.sh` in the background and writes a `LegResult` to S3, plus three Terraform roots: `bootstrap` (state bucket + fenced CI role, applied once locally by the owner), `foundation` (ECR, results bucket, runtime/invoker roles, budget + hard stop) and `runtime` (the AgentCore runtime pointing at an image digest). The fa fork gets one smoke workflow that assumes the invoker role via GitHub OIDC, invokes a hello leg, and waits for its result.
+**Architecture:** A new repo `dark-factory-aws` holds a small Dart HTTP shim (same toolchain as fa) (the AgentCore `/ping` + `/invocations` contract) that runs `run-leg.sh` in the background and writes a `LegResult` to S3, plus three Terraform roots: `bootstrap` (state bucket + fenced CI role, applied once locally by the owner), `foundation` (ECR, results bucket, runtime/invoker roles, budget + hard stop) and `runtime` (the AgentCore runtime pointing at an image digest). The fa fork gets one smoke workflow that assumes the invoker role via GitHub OIDC, invokes a hello leg, and waits for its result.
 
-**Tech Stack:** Python 3.12 (stdlib `http.server`, boto3, pytest, uv), Docker (linux/arm64), Terraform 1.16 with `hashicorp/aws` 6.65.0 and `terraform test` mock providers, GitHub Actions with OIDC, AWS CLI v2.
+**Tech Stack:** Dart ≥ 3.12 (`dart:io` HttpServer, AOT `dart compile exe`, `package:test`, `package:lints`), aws CLI for S3 (Dart has no official AWS SDK), Docker (linux/arm64), Terraform 1.16 with `hashicorp/aws` 6.65.0 and `terraform test` mock providers, GitHub Actions with OIDC, AWS CLI v2.
 
 **Spec:** `docs/superpowers/specs/2026-10-08-agentcore-executor-design.md` (this repo, branch `docs/agentcore-executor-spec`). This plan covers milestone **M0** only; M1–M5 get their own plans after M0's findings.
 
@@ -20,6 +20,7 @@
 - The AWS account ID, budget email, role/runtime ARNs and bucket names never appear in a public repo or public log: pass them as GitHub **secrets** (masked), or derive them at run time.
 - Budget: alert at **$20/month**, hard stop (deny-all on this project's roles) at **$50/month**, filtered to Region `us-east-1`.
 - AgentCore contract: ARM64 image, `0.0.0.0:8080`, `GET /ping` → `{"status": "Healthy"|"HealthyBusy", "time_of_last_update": <unix seconds>}`, `POST /invocations`. Runtime session id ≥ 33 characters. Image ≤ 2 GB.
+- Dart SDK `>=3.12.0 <4.0.0`, `test: ^1.31.2`, `lints: ^6.1.0` — the same floors as fa's `pubspec.yaml`; `dart analyze --fatal-infos` must be clean.
 - `hashicorp/aws` provider pinned to `6.65.0` (same as df-agentcore, proven with `aws_bedrockagentcore_agent_runtime`); Terraform `>= 1.10.0`.
 - GitHub Actions: no `pull_request_target`, no `issue_comment` triggers; third-party actions pinned by commit SHA.
 - Commit identity in new repos: whatever `git config user.*` the owner has; end commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
@@ -27,7 +28,7 @@
 ## Review Focus
 
 1. **A leg spawns background children and then times out** — the whole process group must die; no orphan keeps burning a paid session. (Test added in Task 3.)
-2. **A malformed `Content-Length` header** on `/invocations` — expect a 400 and the session staying `Healthy`, not a 500 or a stuck `HealthyBusy`. (Test added in Task 4.)
+2. **A malformed `Content-Length` header** on `/invocations` — expect a 400 or a closed connection, never a started leg, a crashed server, or a stuck `HealthyBusy`. (Test added in Task 4.)
 3. **AWS budget data lags by hours, so the $50 hard stop is not instant** — the per-session `max_lifetime` (≤ 3600 s in M0) and the smoke workflow's single-run concurrency are the real-time caps; expect them asserted, not assumed. (Test added in Task 8; concurrency in Task 10.)
 4. **The fenced CI role can't step outside the fence** — creating a role without the boundary, touching `df-agentcore-*` buckets, or acting in eu-central-1 must be explicitly denied by IAM itself, not just by our Terraform. (IAM policy simulator checks added in Task 6.)
 5. **df-agentcore is byte-for-byte unchanged after M0** — expect a before/after snapshot diff of its tagged resources, CI role, and OIDC provider to be empty. (Snapshot in Task 0, diff in Task 10.)
@@ -36,34 +37,36 @@
 
 ## File Structure
 
-New repo `~/projects/dark-factory-aws` (GitHub: `rustembuild/dark-factory-aws`, **private**):
+New repo `~/projects/dark-factory-aws` (GitHub: `rustembuild/dark-factory-aws`, **private**). The leg runner is a Dart package at the repo root, the same toolchain as fa:
 
 ```
 dark-factory-aws/
-├── pyproject.toml                 # leg-runner package, deps, pytest config
-├── requirements.lock              # hashed runtime deps for the image (uv export)
-├── leg_runner/
-│   ├── __init__.py
-│   ├── busy.py                    # BusyTracker: Healthy/HealthyBusy + one leg per session
-│   ├── spec.py                    # parse_leg_spec: validate the LegSpec payload
-│   ├── results.py                 # result_key, FileResultWriter, S3ResultWriter
-│   ├── job.py                     # run_leg: run the leg command, deliver LegResult
-│   ├── server.py                  # make_server: /ping + /invocations
-│   └── main.py                    # container entrypoint
-├── runner/run-leg.sh              # M0 hello leg (replaced by the real leg in M2)
-├── Dockerfile
+├── pubspec.yaml / pubspec.lock     # leg_runner package (no runtime deps; test + lints for dev)
+├── analysis_options.yaml
+├── lib/
+│   ├── leg_runner.dart             # exports
+│   └── src/
+│       ├── busy.dart               # BusyTracker: Healthy/HealthyBusy + one leg per session
+│       ├── spec.dart               # parseLegSpec: validate the LegSpec payload
+│       ├── results.dart            # resultKey, FileResultWriter, AwsCliResultWriter
+│       ├── job.dart                # runLeg: run the leg command, deliver LegResult
+│       ├── server.dart             # serve: /ping + /invocations
+│       └── config.dart             # buildWriter from the environment
+├── bin/leg_runner.dart             # container entrypoint (compiled AOT)
+├── test/                           # package:test, one file per lib/src module
+├── runner/run-leg.sh               # M0 hello leg (replaced by the real leg in M2)
+├── Dockerfile                      # dart:stable build → debian slim + aws CLI
 ├── .dockerignore
-├── scripts/contract-test.sh       # runs the image locally, checks the contract
-├── tests/                         # pytest, one file per leg_runner module
+├── scripts/contract-test.sh        # runs the image locally, checks the contract
 ├── terraform/
-│   ├── bootstrap/                 # state bucket + fa-ac-ci role + fa-ac-boundary (local, once)
-│   ├── foundation/                # ECR, results bucket, runtime/invoker roles, budget
-│   └── runtime/                   # aws_bedrockagentcore_agent_runtime
-├── docs/m0-findings.md            # measured results (Task 10)
+│   ├── bootstrap/                  # state bucket + fa-ac-ci role + fa-ac-boundary (local, once)
+│   ├── foundation/                 # ECR, results bucket, runtime/invoker roles, budget
+│   └── runtime/                    # aws_bedrockagentcore_agent_runtime
+├── docs/m0-findings.md             # measured results (Task 10)
 └── .github/workflows/
-    ├── test.yml                   # pytest + terraform fmt/validate/test
-    ├── deploy.yml                 # foundation → image → runtime
-    └── whoami.yml                 # prints this repo's OIDC subject
+    ├── test.yml                    # dart analyze/test + contract test + terraform fmt/validate/test
+    ├── deploy.yml                  # foundation → image → runtime
+    └── whoami.yml                  # prints this repo's OIDC subject
 ```
 
 This repo (`rustembuild/flutter_agent_harness_agentcore`):
@@ -81,15 +84,18 @@ This repo (`rustembuild/flutter_agent_harness_agentcore`):
 **Interfaces:**
 - Produces: `~/.cache/fa-ac/df-snapshot-before.json` (consumed by Task 10), the owner's AWS CLI profile name (used as `AWS_PROFILE` in Task 6), confirmation that us-east-1 spend is ~0.
 
-- [ ] **Step 1: Install local tools the plan needs**
+- [ ] **Step 1: Install the Dart SDK (ARM64) locally**
 
-`uv` is missing on the owner's machine (Python 3.13, Docker, AWS CLI, Terraform 1.16.3, gh are present).
+Dart is missing on the owner's machine (Docker, AWS CLI, Terraform 1.16.3 and gh are present).
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv --version
+curl -fsSLo /tmp/dartsdk.zip https://storage.googleapis.com/dart-archive/channels/stable/release/latest/sdk/dartsdk-linux-arm64-release.zip
+rm -rf ~/.local/dart-sdk && unzip -q /tmp/dartsdk.zip -d ~/.local && rm /tmp/dartsdk.zip
+echo 'export PATH="$HOME/.local/dart-sdk/bin:$PATH"' >> ~/.bashrc
+export PATH="$HOME/.local/dart-sdk/bin:$PATH"
+dart --version
 ```
-Expected: `uv 0.x.y`.
+Expected: `Dart SDK version: 3.x.y (stable)` with x ≥ 12 (fa's floor).
 
 - [ ] **Step 2: Confirm GitHub access for both repos**
 
@@ -157,168 +163,167 @@ Expected: `snapshot ok`.
 ### Task 1: Repo scaffold + BusyTracker
 
 **Files:**
-- Create: `~/projects/dark-factory-aws/pyproject.toml`, `.gitignore`, `leg_runner/__init__.py`, `leg_runner/busy.py`
-- Test: `tests/test_busy.py`
+- Create: `~/projects/dark-factory-aws/pubspec.yaml`, `analysis_options.yaml`, `.gitignore`, `lib/leg_runner.dart`, `lib/src/busy.dart`
+- Test: `test/busy_test.dart`
 
 **Interfaces:**
-- Produces: `BusyTracker(clock: Callable[[], float] = time.time)` with `try_start() -> bool`, `finish() -> None`, `ping() -> dict` (`{"status": "Healthy"|"HealthyBusy", "time_of_last_update": int}`).
+- Produces: `BusyTracker({int Function()? clock})` (clock returns unix seconds) with `bool tryStart()`, `void finish()`, `Map<String, Object> ping()` → `{'status': 'Healthy'|'HealthyBusy', 'time_of_last_update': int}`. Dart runs the server and legs on one event loop, so no locking is needed.
 
 - [ ] **Step 1: Create the repo and project files**
 
 ```bash
-mkdir -p ~/projects/dark-factory-aws/{leg_runner,tests,runner,scripts,docs}
+mkdir -p ~/projects/dark-factory-aws/{lib/src,bin,test,runner,scripts,docs}
 cd ~/projects/dark-factory-aws && git init -b main
-touch leg_runner/__init__.py
 ```
 
-`pyproject.toml`:
-```toml
-[project]
-name = "leg-runner"
-version = "0.1.0"
-description = "AgentCore Runtime shim that runs one factory leg per session"
-requires-python = ">=3.12"
-dependencies = ["boto3>=1.40"]
+`pubspec.yaml`:
+```yaml
+name: leg_runner
+description: AgentCore Runtime service that runs one factory leg per session.
+publish_to: none
 
-[dependency-groups]
-dev = ["pytest>=8"]
+environment:
+  sdk: '>=3.12.0 <4.0.0'
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+dev_dependencies:
+  lints: ^6.1.0
+  test: ^1.31.2
+```
 
-[tool.hatch.build.targets.wheel]
-packages = ["leg_runner"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+`analysis_options.yaml`:
+```yaml
+include: package:lints/recommended.yaml
 ```
 
 `.gitignore`:
 ```
-.venv/
-__pycache__/
-*.pyc
+.dart_tool/
+build/
 .terraform/
 *.tfstate
 *.tfstate.*
 .terraform.tfstate.lock.info
 ```
 
-```bash
-uv sync
+`lib/leg_runner.dart`:
+```dart
+/// AgentCore Runtime leg runner: the /ping + /invocations contract around
+/// one factory leg per session.
+library;
+
+export 'src/busy.dart';
+export 'src/config.dart';
+export 'src/job.dart';
+export 'src/results.dart';
+export 'src/server.dart';
+export 'src/spec.dart';
 ```
-Expected: creates `.venv` and `uv.lock`.
 
-- [ ] **Step 2: Write the failing test** — `tests/test_busy.py`
+```bash
+dart pub get
+```
+Expected: `Got dependencies!` and a `pubspec.lock`. (`dart analyze` reports the missing `src/` files until Task 4 — expected.)
 
-```python
-from leg_runner.busy import BusyTracker
+- [ ] **Step 2: Write the failing test** — `test/busy_test.dart`
 
+```dart
+import 'package:leg_runner/src/busy.dart';
+import 'package:test/test.dart';
 
-class FakeClock:
-    def __init__(self, now=1000.0):
-        self.now = now
+void main() {
+  late int now;
+  BusyTracker tracker() => BusyTracker(clock: () => now);
 
-    def __call__(self):
-        return self.now
+  setUp(() => now = 1000);
 
+  test('idle tracker reports Healthy', () {
+    expect(tracker().ping(), {'status': 'Healthy', 'time_of_last_update': 1000});
+  });
 
-def test_idle_tracker_reports_healthy():
-    busy = BusyTracker(clock=FakeClock(1000))
-    assert busy.ping() == {"status": "Healthy", "time_of_last_update": 1000}
+  test('started tracker reports HealthyBusy with the change time', () {
+    final busy = tracker();
+    now = 1005;
+    expect(busy.tryStart(), isTrue);
+    expect(busy.ping(), {'status': 'HealthyBusy', 'time_of_last_update': 1005});
+  });
 
+  test('second start is refused while busy', () {
+    final busy = tracker();
+    expect(busy.tryStart(), isTrue);
+    expect(busy.tryStart(), isFalse);
+  });
 
-def test_started_tracker_reports_busy_with_change_time():
-    clock = FakeClock(1000)
-    busy = BusyTracker(clock=clock)
-    clock.now = 1005
-    assert busy.try_start() is True
-    assert busy.ping() == {"status": "HealthyBusy", "time_of_last_update": 1005}
+  test('finish returns to Healthy and allows the next leg', () {
+    final busy = tracker()..tryStart();
+    now = 1010;
+    busy.finish();
+    expect(busy.ping(), {'status': 'Healthy', 'time_of_last_update': 1010});
+    expect(busy.tryStart(), isTrue);
+  });
 
-
-def test_second_start_is_refused_while_busy():
-    busy = BusyTracker(clock=FakeClock())
-    assert busy.try_start() is True
-    assert busy.try_start() is False
-
-
-def test_finish_returns_to_healthy_and_allows_next_leg():
-    clock = FakeClock(1000)
-    busy = BusyTracker(clock=clock)
-    busy.try_start()
-    clock.now = 1010
-    busy.finish()
-    assert busy.ping() == {"status": "Healthy", "time_of_last_update": 1010}
-    assert busy.try_start() is True
-
-
-def test_ping_does_not_move_time_of_last_update():
-    clock = FakeClock(1000)
-    busy = BusyTracker(clock=clock)
-    clock.now = 2000
-    assert busy.ping()["time_of_last_update"] == 1000
+  test('ping does not move time_of_last_update', () {
+    final busy = tracker();
+    now = 2000;
+    expect(busy.ping()['time_of_last_update'], 1000);
+  });
+}
 ```
 
 - [ ] **Step 3: Run it to verify it fails**
 
-Run: `uv run pytest tests/test_busy.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'leg_runner.busy'`.
+Run: `dart test test/busy_test.dart`
+Expected: FAIL — `Error: Error when reading 'lib/src/busy.dart': No such file or directory`.
 
-- [ ] **Step 4: Implement** — `leg_runner/busy.py`
+- [ ] **Step 4: Implement** — `lib/src/busy.dart`
 
-```python
-"""Session health for the AgentCore /ping contract.
+```dart
+/// Session health for the AgentCore /ping contract.
+///
+/// AgentCore keeps a session alive while /ping says HealthyBusy and reclaims
+/// it after the idle timeout once it says Healthy. One session runs one leg.
+class BusyTracker {
+  BusyTracker({int Function()? clock}) : _clock = clock ?? _unixSeconds {
+    _changedAt = _clock();
+  }
 
-AgentCore keeps a session alive while /ping says HealthyBusy and reclaims it
-after the idle timeout once it says Healthy. One session runs one leg at a time.
-"""
-import threading
-import time
-from typing import Callable
+  final int Function() _clock;
+  bool _busy = false;
+  late int _changedAt;
 
+  static int _unixSeconds() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
 
-class BusyTracker:
-    def __init__(self, clock: Callable[[], float] = time.time):
-        self._clock = clock
-        self._lock = threading.Lock()
-        self._busy = False
-        self._changed_at = int(clock())
+  /// Claims the session for a leg; false if a leg is already running.
+  bool tryStart() {
+    if (_busy) return false;
+    _busy = true;
+    _changedAt = _clock();
+    return true;
+  }
 
-    def try_start(self) -> bool:
-        """Claim the session for a leg; False if a leg is already running."""
-        with self._lock:
-            if self._busy:
-                return False
-            self._busy = True
-            self._changed_at = int(self._clock())
-            return True
+  void finish() {
+    if (!_busy) return;
+    _busy = false;
+    _changedAt = _clock();
+  }
 
-    def finish(self) -> None:
-        with self._lock:
-            if self._busy:
-                self._busy = False
-                self._changed_at = int(self._clock())
-
-    def ping(self) -> dict:
-        # time_of_last_update moves only when the status changes (contract).
-        with self._lock:
-            return {
-                "status": "HealthyBusy" if self._busy else "Healthy",
-                "time_of_last_update": self._changed_at,
-            }
+  /// time_of_last_update moves only when the status changes (contract).
+  Map<String, Object> ping() => {
+        'status': _busy ? 'HealthyBusy' : 'Healthy',
+        'time_of_last_update': _changedAt,
+      };
+}
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/test_busy.py -v`
-Expected: 5 passed.
+Run: `dart test test/busy_test.dart`
+Expected: `+5: All tests passed!`
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add pyproject.toml uv.lock .gitignore leg_runner tests
-git commit -m "feat: leg-runner scaffold and BusyTracker for the AgentCore ping contract
+git add pubspec.yaml pubspec.lock analysis_options.yaml .gitignore lib test
+git commit -m "feat: leg_runner scaffold and BusyTracker for the AgentCore ping contract
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -328,131 +333,148 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 2: LegSpec validation
 
 **Files:**
-- Create: `leg_runner/spec.py`
-- Test: `tests/test_spec.py`
+- Create: `lib/src/spec.dart`
+- Test: `test/spec_test.dart`
 
 **Interfaces:**
-- Produces: `parse_leg_spec(raw: bytes) -> dict` (raises `SpecError(ValueError)`), constant `MAX_SECONDS_CAP = 28800`. A valid spec has `sessionId` matching `[A-Za-z0-9_-]{1,100}`, non-empty string `leg`, integer `maxSeconds` in 1..28800, `callback == {"type": "s3", ...}`. Extra keys (e.g. `hello`) pass through untouched.
+- Produces: `Map<String, Object?> parseLegSpec(List<int> raw)` (throws `SpecException` with `.message`), `const maxSecondsCap = 28800`. A valid spec has `sessionId` matching `^[A-Za-z0-9_-]{1,100}$`, non-empty string `leg`, int `maxSeconds` in 1..28800, `callback` map with `type == 's3'`. Extra keys (e.g. `hello`) pass through untouched.
 
-- [ ] **Step 1: Write the failing test** — `tests/test_spec.py`
+- [ ] **Step 1: Write the failing test** — `test/spec_test.dart`
 
-```python
-import json
+```dart
+import 'dart:convert';
 
-import pytest
+import 'package:leg_runner/src/spec.dart';
+import 'package:test/test.dart';
 
-from leg_runner.spec import MAX_SECONDS_CAP, SpecError, parse_leg_spec
+/// A valid spec with [overrides] applied; a null value removes the key.
+List<int> raw([Map<String, Object?> overrides = const {}]) {
+  final spec = <String, Object?>{
+    'sessionId': 's' * 40,
+    'leg': 'hello',
+    'maxSeconds': 60,
+    'callback': {'type': 's3'},
+    ...overrides,
+  }..removeWhere((_, value) => value == null);
+  return utf8.encode(jsonEncode(spec));
+}
 
+void main() {
+  test('accepts a minimal valid spec', () {
+    expect(parseLegSpec(raw())['sessionId'], 's' * 40);
+  });
 
-def _raw(**overrides):
-    spec = {"sessionId": "s" * 40, "leg": "hello", "maxSeconds": 60, "callback": {"type": "s3"}}
-    spec.update(overrides)
-    return json.dumps({k: v for k, v in spec.items() if v is not None}).encode()
+  test('passes extra keys through', () {
+    expect(parseLegSpec(raw({'hello': {'sleepSeconds': 5}}))['hello'], {'sleepSeconds': 5});
+  });
 
+  final nonObjects = <String, List<int>>{
+    'empty': [],
+    'not json': utf8.encode('not json'),
+    'invalid utf-8': [0xff, 0xfe, 0x00],
+    'array': utf8.encode('[1, 2]'),
+    'string': utf8.encode('"text"'),
+  };
+  nonObjects.forEach((name, payload) {
+    test('rejects a non-object payload: $name', () {
+      expect(() => parseLegSpec(payload), throwsA(isA<SpecException>()));
+    });
+  });
 
-def test_accepts_minimal_valid_spec():
-    assert parse_leg_spec(_raw())["sessionId"] == "s" * 40
-
-
-def test_passes_extra_keys_through():
-    assert parse_leg_spec(_raw(hello={"sleepSeconds": 5}))["hello"] == {"sleepSeconds": 5}
-
-
-@pytest.mark.parametrize("raw", [b"", b"not json", b"\xff\xfe\x00", b"[1, 2]", b'"text"'])
-def test_rejects_non_object_payloads(raw):
-    with pytest.raises(SpecError):
-        parse_leg_spec(raw)
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"sessionId": None},
-        {"sessionId": ""},
-        {"sessionId": 42},
-        {"sessionId": "../../etc/passwd"},
-        {"sessionId": "x" * 101},
-        {"leg": None},
-        {"leg": ""},
-        {"maxSeconds": None},
-        {"maxSeconds": 0},
-        {"maxSeconds": MAX_SECONDS_CAP + 1},
-        {"maxSeconds": "60"},
-        {"maxSeconds": True},
-        {"maxSeconds": 1.5},
-        {"callback": None},
-        {"callback": "s3"},
-        {"callback": {"type": "sfn"}},
-    ],
-)
-def test_rejects_invalid_fields(overrides):
-    with pytest.raises(SpecError):
-        parse_leg_spec(_raw(**overrides))
+  final invalid = <Map<String, Object?>>[
+    {'sessionId': null},
+    {'sessionId': ''},
+    {'sessionId': 42},
+    {'sessionId': '../../etc/passwd'},
+    {'sessionId': 'x' * 101},
+    {'leg': null},
+    {'leg': ''},
+    {'maxSeconds': null},
+    {'maxSeconds': 0},
+    {'maxSeconds': maxSecondsCap + 1},
+    {'maxSeconds': '60'},
+    {'maxSeconds': true},
+    {'maxSeconds': 1.5},
+    {'callback': null},
+    {'callback': 's3'},
+    {'callback': {'type': 'sfn'}},
+  ];
+  for (final overrides in invalid) {
+    test('rejects invalid field $overrides', () {
+      expect(() => parseLegSpec(raw(overrides)), throwsA(isA<SpecException>()));
+    });
+  }
+}
 ```
 
 - [ ] **Step 2: Run it to verify it fails**
 
-Run: `uv run pytest tests/test_spec.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'leg_runner.spec'`.
+Run: `dart test test/spec_test.dart`
+Expected: FAIL — `Error when reading 'lib/src/spec.dart'`.
 
-- [ ] **Step 3: Implement** — `leg_runner/spec.py`
+- [ ] **Step 3: Implement** — `lib/src/spec.dart`
 
-```python
-"""Validation of the LegSpec payload POSTed to /invocations (spec §2.2).
+```dart
+import 'dart:convert';
 
-sessionId ends up in an S3 key and a temp-file name, so it is restricted to a
-safe alphabet.
-"""
-import json
-import re
+/// AgentCore's 8-hour session ceiling.
+const maxSecondsCap = 28800;
 
-MAX_SECONDS_CAP = 28800  # AgentCore's 8-hour session ceiling
-_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
+/// sessionId ends up in an S3 key and a file path, so it is restricted to a
+/// safe alphabet.
+final _sessionId = RegExp(r'^[A-Za-z0-9_-]{1,100}$');
 
+/// The payload is not a usable LegSpec; the server answers 400.
+class SpecException implements Exception {
+  SpecException(this.message);
 
-class SpecError(ValueError):
-    """The payload is not a usable LegSpec; the shim answers 400."""
+  final String message;
 
+  @override
+  String toString() => message;
+}
 
-def parse_leg_spec(raw: bytes) -> dict:
-    try:
-        spec = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SpecError(f"payload is not JSON: {error}") from error
-    if not isinstance(spec, dict):
-        raise SpecError("payload must be a JSON object")
+/// Validates the LegSpec payload POSTed to /invocations (spec §2.2).
+Map<String, Object?> parseLegSpec(List<int> raw) {
+  final Object? decoded;
+  try {
+    decoded = jsonDecode(utf8.decode(raw));
+  } on FormatException catch (error) {
+    throw SpecException('payload is not JSON: ${error.message}');
+  }
+  if (decoded is! Map<String, Object?>) {
+    throw SpecException('payload must be a JSON object');
+  }
 
-    session_id = spec.get("sessionId")
-    if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
-        raise SpecError("sessionId must be 1-100 characters of A-Z a-z 0-9 _ -")
-
-    leg = spec.get("leg")
-    if not isinstance(leg, str) or not leg:
-        raise SpecError("leg is required")
-
-    max_seconds = spec.get("maxSeconds")
-    if (
-        isinstance(max_seconds, bool)
-        or not isinstance(max_seconds, int)
-        or not 1 <= max_seconds <= MAX_SECONDS_CAP
-    ):
-        raise SpecError(f"maxSeconds must be an integer from 1 to {MAX_SECONDS_CAP}")
-
-    callback = spec.get("callback")
-    if not isinstance(callback, dict) or callback.get("type") != "s3":
-        raise SpecError("callback.type must be 's3'")
-    return spec
+  final sessionId = decoded['sessionId'];
+  if (sessionId is! String || !_sessionId.hasMatch(sessionId)) {
+    throw SpecException('sessionId must be 1-100 characters of A-Z a-z 0-9 _ -');
+  }
+  final leg = decoded['leg'];
+  if (leg is! String || leg.isEmpty) {
+    throw SpecException('leg is required');
+  }
+  final maxSeconds = decoded['maxSeconds'];
+  if (maxSeconds is! int || maxSeconds < 1 || maxSeconds > maxSecondsCap) {
+    throw SpecException('maxSeconds must be an integer from 1 to $maxSecondsCap');
+  }
+  final callback = decoded['callback'];
+  if (callback is! Map || callback['type'] != 's3') {
+    throw SpecException("callback.type must be 's3'");
+  }
+  return decoded;
+}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `uv run pytest tests/test_spec.py -v`
-Expected: 23 passed.
+Run: `dart test test/spec_test.dart`
+Expected: `+23: All tests passed!`
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add leg_runner/spec.py tests/test_spec.py
+git add lib/src/spec.dart test/spec_test.dart
 git commit -m "feat: validate LegSpec payloads
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -460,243 +482,282 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: Result writers + run_leg
+### Task 3: Result writers + runLeg
 
 **Files:**
-- Create: `leg_runner/results.py`, `leg_runner/job.py`
-- Test: `tests/test_job.py`
+- Create: `lib/src/results.dart`, `lib/src/job.dart`
+- Test: `test/results_test.dart`, `test/job_test.dart`
 
 **Interfaces:**
 - Consumes: `BusyTracker` (Task 1).
 - Produces:
-  - `result_key(session_id: str) -> str` → `"legs/<session_id>/result.json"`.
-  - `ResultWriter` protocol: `write(session_id: str, result: dict) -> None`; `FileResultWriter(root: Path)`; `S3ResultWriter(bucket: str, client)` (boto3 S3 client).
-  - `run_leg(spec: dict, writer: ResultWriter, busy: BusyTracker, command: list[str], clock=time.monotonic) -> None`: runs `[*command, <spec-json-path>]` in its own process group, kills the group at `maxSeconds`, writes `LegResult` = `{"sessionId", "status": "ok"|"agent_failed"|"infra_error", "exitCode": int|None, "durationSeconds": float, "reason"?: str}`, always calls `busy.finish()`.
+  - `String resultKey(String sessionId)` → `'legs/<sessionId>/result.json'`.
+  - `abstract interface class ResultWriter { Future<void> write(String sessionId, Map<String, Object?> result); }`; `FileResultWriter(Directory root)`; `AwsCliResultWriter(String bucket, {ProcessRunner? run})` where `typedef ProcessRunner = Future<ProcessResult> Function(String executable, List<String> arguments)` — runs `aws s3api put-object --bucket <b> --key <resultKey> --body <tmp json> --content-type application/json`, throws `StateError` on non-zero exit.
+  - `Future<void> runLeg(Map<String, Object?> spec, ResultWriter writer, BusyTracker busy, List<String> command)`: runs `setsid <command...> <spec-json-path>` (own process group), kills the group at `maxSeconds`, writes `LegResult` = `{'status': 'ok'|'agent_failed'|'infra_error', 'exitCode': int?, 'sessionId', 'durationSeconds': double, 'reason'?: String}`, always calls `busy.finish()`. Exit codes 126/127 (command not executable / not found) are `infra_error`.
 
-- [ ] **Step 1: Write the failing test** — `tests/test_job.py`
+- [ ] **Step 1: Write the failing writer test** — `test/results_test.dart`
 
-```python
-import json
-import os
-import sys
-import time
+```dart
+import 'dart:convert';
+import 'dart:io';
 
-from leg_runner.busy import BusyTracker
-from leg_runner.job import run_leg
-from leg_runner.results import FileResultWriter, S3ResultWriter, result_key
+import 'package:leg_runner/src/results.dart';
+import 'package:test/test.dart';
 
+void main() {
+  test('resultKey layout', () {
+    expect(resultKey('abc'), 'legs/abc/result.json');
+  });
 
-def _spec(max_seconds=30):
-    return {"sessionId": "sess-1", "leg": "hello", "maxSeconds": max_seconds, "callback": {"type": "s3"}}
+  test('AwsCliResultWriter puts the JSON under the result key', () async {
+    late List<String> args;
+    late String body;
+    final writer = AwsCliResultWriter('bucket-x', run: (exe, arguments) async {
+      expect(exe, 'aws');
+      args = arguments;
+      body = File(arguments[arguments.indexOf('--body') + 1]).readAsStringSync();
+      return ProcessResult(0, 0, '', '');
+    });
+    await writer.write('sess-1', {'status': 'ok'});
+    expect(args, [
+      's3api', 'put-object', '--bucket', 'bucket-x', '--key', 'legs/sess-1/result.json',
+      '--body', args[7], '--content-type', 'application/json',
+    ]);
+    expect(jsonDecode(body), {'status': 'ok'});
+  });
 
-
-def _started():
-    busy = BusyTracker()
-    assert busy.try_start()
-    return busy
-
-
-def _result(root):
-    return json.loads((root / result_key("sess-1")).read_text())
-
-
-def test_result_key_layout():
-    assert result_key("abc") == "legs/abc/result.json"
-
-
-def test_successful_command_reports_ok_and_frees_session(tmp_path):
-    busy = _started()
-    run_leg(_spec(), FileResultWriter(tmp_path), busy, ["bash", "-c", "exit 0"])
-    result = _result(tmp_path)
-    assert result["status"] == "ok"
-    assert result["exitCode"] == 0
-    assert result["sessionId"] == "sess-1"
-    assert result["durationSeconds"] >= 0
-    assert busy.ping()["status"] == "Healthy"
-
-
-def test_failing_command_reports_agent_failed(tmp_path):
-    run_leg(_spec(), FileResultWriter(tmp_path), _started(), ["bash", "-c", "exit 3"])
-    result = _result(tmp_path)
-    assert result["status"] == "agent_failed"
-    assert result["exitCode"] == 3
-
-
-def test_command_over_max_seconds_is_killed_and_reported(tmp_path):
-    run_leg(_spec(max_seconds=1), FileResultWriter(tmp_path), _started(), ["bash", "-c", "sleep 30"])
-    result = _result(tmp_path)
-    assert result["status"] == "infra_error"
-    assert result["reason"] == "timeout"
-    assert result["durationSeconds"] < 10
-
-
-def test_timeout_kills_background_children_too(tmp_path):
-    pid_file = tmp_path / "child.pid"
-    script = f'sleep 60 & echo $! > {pid_file}; wait'
-    run_leg(_spec(max_seconds=1), FileResultWriter(tmp_path), _started(), ["bash", "-c", script])
-    child = int(pid_file.read_text())
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.kill(child, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"background child {child} survived the leg timeout")
-
-
-def test_missing_command_reports_infra_error(tmp_path):
-    run_leg(_spec(), FileResultWriter(tmp_path), _started(), ["/nonexistent/run-leg.sh"])
-    result = _result(tmp_path)
-    assert result["status"] == "infra_error"
-    assert result["reason"].startswith("could not start")
-
-
-def test_command_receives_the_spec_as_a_file(tmp_path):
-    seen = tmp_path / "seen.json"
-    command = [sys.executable, "-c", f"import shutil, sys; shutil.copy(sys.argv[1], {str(seen)!r})"]
-    run_leg(_spec(), FileResultWriter(tmp_path), _started(), command)
-    assert json.loads(seen.read_text())["sessionId"] == "sess-1"
-
-
-def test_writer_failure_still_frees_the_session():
-    class BrokenWriter:
-        def write(self, session_id, result):
-            raise RuntimeError("s3 is down")
-
-    busy = _started()
-    run_leg(_spec(), BrokenWriter(), busy, ["bash", "-c", "exit 0"])
-    assert busy.ping()["status"] == "Healthy"
-
-
-def test_s3_writer_puts_json_under_the_result_key():
-    calls = []
-
-    class FakeS3:
-        def put_object(self, **kwargs):
-            calls.append(kwargs)
-
-    S3ResultWriter("bucket-x", FakeS3()).write("sess-1", {"status": "ok"})
-    assert calls == [
-        {
-            "Bucket": "bucket-x",
-            "Key": "legs/sess-1/result.json",
-            "Body": b'{"status": "ok"}',
-            "ContentType": "application/json",
-        }
-    ]
+  test('AwsCliResultWriter surfaces a failed upload', () async {
+    final writer = AwsCliResultWriter('bucket-x', run: (_, _) async => ProcessResult(0, 255, '', 'AccessDenied'));
+    expect(() => writer.write('sess-1', {'status': 'ok'}), throwsA(isA<StateError>()));
+  });
+}
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [ ] **Step 2: Write the failing job test** — `test/job_test.dart`
 
-Run: `uv run pytest tests/test_job.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'leg_runner.job'`.
+```dart
+import 'dart:convert';
+import 'dart:io';
 
-- [ ] **Step 3: Implement** — `leg_runner/results.py`
+import 'package:leg_runner/src/busy.dart';
+import 'package:leg_runner/src/job.dart';
+import 'package:leg_runner/src/results.dart';
+import 'package:test/test.dart';
 
-```python
-"""Where a LegResult goes: S3 in AgentCore, a directory in local tests."""
-import json
-from pathlib import Path
-from typing import Protocol
+Map<String, Object?> spec({int maxSeconds = 30}) =>
+    {'sessionId': 'sess-1', 'leg': 'hello', 'maxSeconds': maxSeconds, 'callback': {'type': 's3'}};
 
+BusyTracker started() => BusyTracker()..tryStart();
 
-def result_key(session_id: str) -> str:
-    return f"legs/{session_id}/result.json"
+class BrokenWriter implements ResultWriter {
+  @override
+  Future<void> write(String sessionId, Map<String, Object?> result) async => throw StateError('s3 is down');
+}
 
+void main() {
+  late Directory root;
 
-class ResultWriter(Protocol):
-    def write(self, session_id: str, result: dict) -> None: ...
+  setUp(() async => root = await Directory.systemTemp.createTemp('legtest-'));
+  tearDown(() => root.delete(recursive: true));
 
+  Map<String, Object?> result() =>
+      jsonDecode(File('${root.path}/${resultKey('sess-1')}').readAsStringSync()) as Map<String, Object?>;
 
-class FileResultWriter:
-    def __init__(self, root: Path):
-        self._root = root
+  test('successful command reports ok and frees the session', () async {
+    final busy = started();
+    await runLeg(spec(), FileResultWriter(root), busy, ['bash', '-c', 'exit 0']);
+    expect(result(), containsPair('status', 'ok'));
+    expect(result(), containsPair('exitCode', 0));
+    expect(result(), containsPair('sessionId', 'sess-1'));
+    expect(busy.ping()['status'], 'Healthy');
+  });
 
-    def write(self, session_id: str, result: dict) -> None:
-        path = self._root / result_key(session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(result))
+  test('the leg runs to completion, not just until setsid returns', () async {
+    await runLeg(spec(), FileResultWriter(root), started(), ['bash', '-c', 'sleep 1']);
+    expect(result()['durationSeconds'] as num, greaterThanOrEqualTo(0.9));
+  });
 
+  test('failing command reports agent_failed', () async {
+    await runLeg(spec(), FileResultWriter(root), started(), ['bash', '-c', 'exit 3']);
+    expect(result(), containsPair('status', 'agent_failed'));
+    expect(result(), containsPair('exitCode', 3));
+  });
 
-class S3ResultWriter:
-    def __init__(self, bucket: str, client):
-        self._bucket = bucket
-        self._client = client
+  test('command over maxSeconds is killed and reported', () async {
+    await runLeg(spec(maxSeconds: 1), FileResultWriter(root), started(), ['bash', '-c', 'sleep 30']);
+    expect(result(), containsPair('status', 'infra_error'));
+    expect(result(), containsPair('reason', 'timeout'));
+    expect(result()['durationSeconds'] as num, lessThan(10));
+  });
 
-    def write(self, session_id: str, result: dict) -> None:
-        self._client.put_object(
-            Bucket=self._bucket,
-            Key=result_key(session_id),
-            Body=json.dumps(result).encode(),
-            ContentType="application/json",
-        )
+  test('timeout kills background children too', () async {
+    final pidFile = '${root.path}/child.pid';
+    await runLeg(spec(maxSeconds: 1), FileResultWriter(root), started(),
+        ['bash', '-c', 'sleep 60 & echo \$! > $pidFile; wait']);
+    final child = File(pidFile).readAsStringSync().trim();
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (Directory('/proc/$child').existsSync()) {
+      if (DateTime.now().isAfter(deadline)) fail('background child $child survived the leg timeout');
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  });
+
+  test('missing command reports infra_error', () async {
+    await runLeg(spec(), FileResultWriter(root), started(), ['/nonexistent/run-leg.sh']);
+    expect(result(), containsPair('status', 'infra_error'));
+    expect(result()['reason'] as String, startsWith('could not start'));
+  });
+
+  test('the command receives the spec as a file', () async {
+    final seen = '${root.path}/seen.json';
+    await runLeg(spec(), FileResultWriter(root), started(), ['bash', '-c', 'cp "\$1" $seen', '_']);
+    expect(jsonDecode(File(seen).readAsStringSync()), containsPair('sessionId', 'sess-1'));
+  });
+
+  test('writer failure still frees the session', () async {
+    final busy = started();
+    await runLeg(spec(), BrokenWriter(), busy, ['bash', '-c', 'exit 0']);
+    expect(busy.ping()['status'], 'Healthy');
+  });
+}
 ```
 
-- [ ] **Step 4: Implement** — `leg_runner/job.py`
+- [ ] **Step 3: Run them to verify they fail**
 
-```python
-"""Run one leg: hand the LegSpec to the leg command, then deliver a LegResult.
+Run: `dart test test/results_test.dart test/job_test.dart`
+Expected: FAIL — `Error when reading 'lib/src/results.dart'`.
 
-The command runs in its own process group so a timeout kills everything the
-leg started, not just the top process — an orphan would keep a paid session busy.
-"""
-import json
-import logging
-import os
-import signal
-import subprocess
-import tempfile
-import time
+- [ ] **Step 4: Implement** — `lib/src/results.dart`
 
-from leg_runner.busy import BusyTracker
-from leg_runner.results import ResultWriter
+```dart
+import 'dart:convert';
+import 'dart:io';
 
-log = logging.getLogger(__name__)
+String resultKey(String sessionId) => 'legs/$sessionId/result.json';
 
+/// Where a LegResult goes: S3 in AgentCore, a directory in local tests.
+abstract interface class ResultWriter {
+  Future<void> write(String sessionId, Map<String, Object?> result);
+}
 
-def run_leg(spec: dict, writer: ResultWriter, busy: BusyTracker, command: list[str], clock=time.monotonic) -> None:
-    started = clock()
-    try:
-        result = _execute(spec, command)
-        result.update(sessionId=spec["sessionId"], durationSeconds=round(clock() - started, 3))
-        try:
-            writer.write(spec["sessionId"], result)
-        except Exception:
-            log.exception("could not deliver LegResult for session %s", spec["sessionId"])
-    finally:
-        busy.finish()
+class FileResultWriter implements ResultWriter {
+  FileResultWriter(this.root);
 
+  final Directory root;
 
-def _execute(spec: dict, command: list[str]) -> dict:
-    fd, spec_path = tempfile.mkstemp(prefix="legspec-", suffix=".json")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(spec, handle)
-        try:
-            process = subprocess.Popen([*command, spec_path], start_new_session=True)
-        except OSError as error:
-            return {"status": "infra_error", "exitCode": None, "reason": f"could not start leg command: {error}"}
-        try:
-            code = process.wait(timeout=spec["maxSeconds"])
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            return {"status": "infra_error", "exitCode": None, "reason": "timeout"}
-        return {"status": "ok" if code == 0 else "agent_failed", "exitCode": code}
-    finally:
-        os.unlink(spec_path)
+  @override
+  Future<void> write(String sessionId, Map<String, Object?> result) async {
+    final file = File('${root.path}/${resultKey(sessionId)}');
+    await file.parent.create(recursive: true);
+    await file.writeAsString(jsonEncode(result));
+  }
+}
+
+typedef ProcessRunner = Future<ProcessResult> Function(String executable, List<String> arguments);
+
+/// Uploads through the aws CLI baked into the image: Dart has no official AWS
+/// SDK, and the CLI picks up the runtime role's credentials by itself.
+class AwsCliResultWriter implements ResultWriter {
+  AwsCliResultWriter(this.bucket, {ProcessRunner? run}) : _run = run ?? Process.run;
+
+  final String bucket;
+  final ProcessRunner _run;
+
+  @override
+  Future<void> write(String sessionId, Map<String, Object?> result) async {
+    final dir = await Directory.systemTemp.createTemp('legresult-');
+    try {
+      final body = File('${dir.path}/result.json');
+      await body.writeAsString(jsonEncode(result));
+      final outcome = await _run('aws', [
+        's3api', 'put-object', '--bucket', bucket, '--key', resultKey(sessionId),
+        '--body', body.path, '--content-type', 'application/json',
+      ]);
+      if (outcome.exitCode != 0) {
+        throw StateError('aws s3api put-object failed (${outcome.exitCode}): ${outcome.stderr}');
+      }
+    } finally {
+      await dir.delete(recursive: true);
+    }
+  }
+}
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [ ] **Step 5: Implement** — `lib/src/job.dart`
 
-Run: `uv run pytest tests/test_job.py -v`
-Expected: 9 passed.
+```dart
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
-- [ ] **Step 6: Commit**
+import 'busy.dart';
+import 'results.dart';
+
+/// Runs one leg: hands the LegSpec to the leg command, then delivers a LegResult.
+///
+/// `setsid` puts the command in its own process group, so a timeout kills
+/// everything the leg started — an orphan would keep a paid session busy.
+Future<void> runLeg(
+  Map<String, Object?> spec,
+  ResultWriter writer,
+  BusyTracker busy,
+  List<String> command,
+) async {
+  final stopwatch = Stopwatch()..start();
+  final sessionId = spec['sessionId'] as String;
+  try {
+    final result = await _execute(spec, command)
+      ..['sessionId'] = sessionId
+      ..['durationSeconds'] = stopwatch.elapsedMilliseconds / 1000;
+    try {
+      await writer.write(sessionId, result);
+    } catch (error) {
+      stderr.writeln('could not deliver LegResult for session $sessionId: $error');
+    }
+  } finally {
+    busy.finish();
+  }
+}
+
+Future<Map<String, Object?>> _execute(Map<String, Object?> spec, List<String> command) async {
+  final dir = await Directory.systemTemp.createTemp('legspec-');
+  try {
+    final specFile = File('${dir.path}/spec.json');
+    await specFile.writeAsString(jsonEncode(spec));
+    final Process process;
+    try {
+      process = await Process.start('setsid', [...command, specFile.path], mode: ProcessStartMode.inheritStdio);
+    } on ProcessException catch (error) {
+      return {'status': 'infra_error', 'exitCode': null, 'reason': 'could not start leg command: ${error.message}'};
+    }
+    final int code;
+    try {
+      code = await process.exitCode.timeout(Duration(seconds: spec['maxSeconds'] as int));
+    } on TimeoutException {
+      // setsid execs the command in place, so its pid is the process-group id.
+      await Process.run('bash', ['-c', 'kill -KILL -- -${process.pid}']);
+      await process.exitCode;
+      return {'status': 'infra_error', 'exitCode': null, 'reason': 'timeout'};
+    }
+    if (code == 126 || code == 127) {
+      return {'status': 'infra_error', 'exitCode': code, 'reason': 'could not start leg command (exit $code)'};
+    }
+    return {'status': code == 0 ? 'ok' : 'agent_failed', 'exitCode': code};
+  } finally {
+    await dir.delete(recursive: true);
+  }
+}
+```
+
+- [ ] **Step 6: Run tests to verify they pass**
+
+Run: `dart test test/results_test.dart test/job_test.dart`
+Expected: `+11: All tests passed!` If "runs to completion" fails, `setsid` forked instead of exec'ing (the Dart child was a process-group leader): switch to `setsid --wait` and record the pid via `bash -c 'echo $$ > "$PIDFILE"; exec "$@"'` — do not drop the test.
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add leg_runner/results.py leg_runner/job.py tests/test_job.py
+git add lib/src/results.dart lib/src/job.dart test/results_test.dart test/job_test.dart
 git commit -m "feat: run a leg in its own process group and deliver its LegResult
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -704,285 +765,273 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: HTTP server + container entrypoint
+### Task 4: HTTP server + configuration + entrypoint
 
 **Files:**
-- Create: `leg_runner/server.py`, `leg_runner/main.py`
-- Test: `tests/test_server.py`, `tests/test_main.py`
+- Create: `lib/src/server.dart`, `lib/src/config.dart`, `bin/leg_runner.dart`
+- Test: `test/server_test.dart`, `test/config_test.dart`
 
 **Interfaces:**
-- Consumes: `BusyTracker` (Task 1), `parse_leg_spec`/`SpecError` (Task 2), `run_leg`, `FileResultWriter`, `S3ResultWriter` (Task 3).
-- Produces: `make_server(host: str, port: int, busy: BusyTracker, start_leg: Callable[[dict], None]) -> ThreadingHTTPServer`; `MAX_BODY_BYTES = 1048576`; responses: `GET /ping` 200 ping JSON; `POST /invocations` 200 `{"accepted": true, "sessionId": ...}`, 400 bad spec or bad `Content-Length`, 409 busy, 413 too large, 404 other paths. `main.build_writer() -> ResultWriter` (env `LEG_RESULT_DIR` → file, else `LEG_RESULT_BUCKET` → S3, else `SystemExit`); `python -m leg_runner.main` serves on `0.0.0.0:8080`, leg command from env `LEG_COMMAND` (default `/app/run-leg.sh`).
+- Consumes: `BusyTracker` (Task 1), `parseLegSpec`/`SpecException` (Task 2), `runLeg`, `FileResultWriter`, `AwsCliResultWriter` (Task 3).
+- Produces: `typedef LegStarter = Future<void> Function(Map<String, Object?> spec)`; `Future<HttpServer> serve(Object address, int port, BusyTracker busy, LegStarter startLeg)`; `const maxBodyBytes = 1048576`; responses: `GET /ping` 200 ping JSON; `POST /invocations` 200 `{"accepted":true,"sessionId":…}`, 400 bad spec, 409 busy, 413 too large, 404 other paths. `ResultWriter buildWriter(Map<String, String> env)` (`LEG_RESULT_DIR` → file, else `LEG_RESULT_BUCKET` → aws CLI, else `StateError`). `bin/leg_runner.dart` serves on `0.0.0.0:8080`, leg command from `LEG_COMMAND` (default `/app/run-leg.sh`).
 
-- [ ] **Step 1: Write the failing server test** — `tests/test_server.py`
+- [ ] **Step 1: Write the failing server test** — `test/server_test.dart`
 
-```python
-import http.client
-import json
-import threading
-import time
-import urllib.error
-import urllib.request
+```dart
+import 'dart:convert';
+import 'dart:io';
 
-import pytest
+import 'package:leg_runner/src/busy.dart';
+import 'package:leg_runner/src/server.dart';
+import 'package:test/test.dart';
 
-from leg_runner.busy import BusyTracker
-from leg_runner.server import MAX_BODY_BYTES, make_server
+const valid = {'sessionId': 'sess-1', 'leg': 'hello', 'maxSeconds': 60, 'callback': {'type': 's3'}};
 
-VALID = {"sessionId": "sess-1", "leg": "hello", "maxSeconds": 60, "callback": {"type": "s3"}}
+void main() {
+  late HttpServer server;
+  late BusyTracker busy;
+  late List<Map<String, Object?>> started;
 
+  setUp(() async {
+    busy = BusyTracker();
+    started = [];
+    server = await serve(InternetAddress.loopbackIPv4, 0, busy, (spec) async => started.add(spec));
+  });
+  tearDown(() => server.close(force: true));
 
-@pytest.fixture
-def shim():
-    busy = BusyTracker()
-    started = []
-    server = make_server("127.0.0.1", 0, busy, started.append)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield server.server_address[1], busy, started
-    server.shutdown()
-    server.server_close()
+  Future<(int, Map<String, Object?>)> call(String path, {Object? body}) async {
+    final client = HttpClient();
+    try {
+      final request = body == null
+          ? await client.get('127.0.0.1', server.port, path)
+          : await client.post('127.0.0.1', server.port, path);
+      if (body != null) request.add(body is List<int> ? body : utf8.encode(jsonEncode(body)));
+      final response = await request.close();
+      final text = await utf8.decodeStream(response);
+      return (response.statusCode, jsonDecode(text) as Map<String, Object?>);
+    } finally {
+      client.close(force: true);
+    }
+  }
 
+  /// Sends raw request bytes; returns everything the server sends back.
+  Future<String> raw(String head) async {
+    final socket = await Socket.connect('127.0.0.1', server.port);
+    socket.write(head);
+    await socket.flush();
+    // Read until the response head arrives or the server closes; the server
+    // may keep an unread body's connection open, so never wait for close.
+    final reply = StringBuffer();
+    await for (final chunk in socket.timeout(const Duration(seconds: 5), onTimeout: (sink) => sink.close())) {
+      reply.write(utf8.decode(chunk, allowMalformed: true));
+      if (reply.toString().contains('\r\n\r\n')) break;
+    }
+    socket.destroy();
+    return reply.toString();
+  }
 
-def _call(port, path, body=None):
-    data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}", data=data, method="GET" if data is None else "POST"
-    )
-    try:
-        with urllib.request.urlopen(request) as response:
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read())
+  test('ping reports Healthy when idle', () async {
+    final (status, body) = await call('/ping');
+    expect(status, 200);
+    expect(body['status'], 'Healthy');
+  });
 
+  test('valid invocation is accepted, started, and marks the session busy', () async {
+    final (status, body) = await call('/invocations', body: valid);
+    expect(status, 200);
+    expect(body, {'accepted': true, 'sessionId': 'sess-1'});
+    expect(started.single['sessionId'], 'sess-1');
+    expect((await call('/ping')).$2['status'], 'HealthyBusy');
+  });
 
-def _wait_for(predicate, timeout=2.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return False
+  test('second invocation while busy is refused', () async {
+    await call('/invocations', body: valid);
+    final (status, body) = await call('/invocations', body: valid);
+    expect(status, 409);
+    expect(body['error'], contains('already running'));
+    expect(started, hasLength(1));
+  });
 
+  test('invalid spec is rejected and the session stays Healthy', () async {
+    final (status, body) = await call('/invocations', body: {'leg': 'hello'});
+    expect(status, 400);
+    expect(body['error'], contains('sessionId'));
+    expect(started, isEmpty);
+    expect((await call('/ping')).$2['status'], 'Healthy');
+  });
 
-def test_ping_reports_healthy_when_idle(shim):
-    port, _, _ = shim
-    status, body = _call(port, "/ping")
-    assert status == 200
-    assert body["status"] == "Healthy"
+  test('non-numeric Content-Length never starts a leg', () async {
+    final reply = await raw('POST /invocations HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\nConnection: close\r\n\r\n');
+    expect(reply, anyOf(isEmpty, startsWith('HTTP/1.1 400')));
+    expect(started, isEmpty);
+    expect((await call('/ping')).$2['status'], 'Healthy');
+  });
 
+  test('oversized body is refused before reading', () async {
+    final reply = await raw('POST /invocations HTTP/1.1\r\nHost: x\r\n'
+        'Content-Length: ${maxBodyBytes + 1}\r\nConnection: close\r\n\r\n');
+    expect(reply, startsWith('HTTP/1.1 413'));
+    expect(started, isEmpty);
+  });
 
-def test_valid_invocation_is_accepted_started_and_marks_busy(shim):
-    port, _, started = shim
-    status, body = _call(port, "/invocations", VALID)
-    assert status == 200
-    assert body == {"accepted": True, "sessionId": "sess-1"}
-    assert _wait_for(lambda: len(started) == 1)
-    assert started[0]["sessionId"] == "sess-1"
-    assert _call(port, "/ping")[1]["status"] == "HealthyBusy"
-
-
-def test_second_invocation_while_busy_is_refused(shim):
-    port, _, started = shim
-    _call(port, "/invocations", VALID)
-    status, body = _call(port, "/invocations", VALID)
-    assert status == 409
-    assert "already running" in body["error"]
-    assert _wait_for(lambda: len(started) == 1)
-    time.sleep(0.05)
-    assert len(started) == 1
-
-
-def test_invalid_spec_is_rejected_and_session_stays_healthy(shim):
-    port, _, started = shim
-    status, body = _call(port, "/invocations", {"leg": "hello"})
-    assert status == 400
-    assert "sessionId" in body["error"]
-    assert started == []
-    assert _call(port, "/ping")[1]["status"] == "Healthy"
-
-
-def test_non_numeric_content_length_is_a_400_not_a_crash(shim):
-    port, _, started = shim
-    connection = http.client.HTTPConnection("127.0.0.1", port)
-    connection.putrequest("POST", "/invocations")
-    connection.putheader("Content-Length", "abc")
-    connection.endheaders()
-    response = connection.getresponse()
-    assert response.status == 400
-    assert started == []
-    assert _call(port, "/ping")[1]["status"] == "Healthy"
-
-
-def test_oversized_body_is_refused_before_reading(shim):
-    port, _, started = shim
-    connection = http.client.HTTPConnection("127.0.0.1", port)
-    connection.putrequest("POST", "/invocations")
-    connection.putheader("Content-Length", str(MAX_BODY_BYTES + 1))
-    connection.endheaders()
-    response = connection.getresponse()
-    assert response.status == 413
-    assert started == []
-
-
-@pytest.mark.parametrize("path", ["/", "/invoke", "/ping/extra"])
-def test_unknown_paths_are_404(shim, path):
-    port, _, _ = shim
-    assert _call(port, path)[0] == 404
-    assert _call(port, path, VALID)[0] == 404
+  for (final path in ['/', '/invoke', '/ping/extra']) {
+    test('unknown path $path is 404', () async {
+      expect((await call(path)).$1, 404);
+      expect((await call(path, body: valid)).$1, 404);
+    });
+  }
+}
 ```
 
-- [ ] **Step 2: Write the failing entrypoint test** — `tests/test_main.py`
+- [ ] **Step 2: Write the failing config test** — `test/config_test.dart`
 
-```python
-import pytest
+```dart
+import 'package:leg_runner/src/config.dart';
+import 'package:leg_runner/src/results.dart';
+import 'package:test/test.dart';
 
-from leg_runner.main import build_writer
-from leg_runner.results import FileResultWriter, S3ResultWriter
+void main() {
+  test('LEG_RESULT_DIR selects the file writer', () {
+    expect(buildWriter({'LEG_RESULT_DIR': '/tmp/results'}), isA<FileResultWriter>());
+  });
 
+  test('LEG_RESULT_BUCKET selects the aws CLI writer', () {
+    final writer = buildWriter({'LEG_RESULT_BUCKET': 'fa-ac-legs-test'});
+    expect(writer, isA<AwsCliResultWriter>());
+    expect((writer as AwsCliResultWriter).bucket, 'fa-ac-legs-test');
+  });
 
-def test_result_dir_selects_the_file_writer(monkeypatch, tmp_path):
-    monkeypatch.setenv("LEG_RESULT_DIR", str(tmp_path))
-    monkeypatch.delenv("LEG_RESULT_BUCKET", raising=False)
-    assert isinstance(build_writer(), FileResultWriter)
-
-
-def test_bucket_selects_the_s3_writer(monkeypatch):
-    monkeypatch.delenv("LEG_RESULT_DIR", raising=False)
-    monkeypatch.setenv("LEG_RESULT_BUCKET", "fa-ac-legs-test")
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    assert isinstance(build_writer(), S3ResultWriter)
-
-
-def test_missing_destination_fails_fast(monkeypatch):
-    monkeypatch.delenv("LEG_RESULT_DIR", raising=False)
-    monkeypatch.delenv("LEG_RESULT_BUCKET", raising=False)
-    with pytest.raises(SystemExit, match="LEG_RESULT_BUCKET"):
-        build_writer()
+  test('a missing destination fails fast', () {
+    expect(() => buildWriter({}), throwsA(isA<StateError>()));
+  });
+}
 ```
 
 - [ ] **Step 3: Run them to verify they fail**
 
-Run: `uv run pytest tests/test_server.py tests/test_main.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'leg_runner.server'`.
+Run: `dart test test/server_test.dart test/config_test.dart`
+Expected: FAIL — `Error when reading 'lib/src/server.dart'`.
 
-- [ ] **Step 4: Implement** — `leg_runner/server.py`
+- [ ] **Step 4: Implement** — `lib/src/server.dart`
 
-```python
-"""HTTP surface of the AgentCore Runtime contract: GET /ping, POST /invocations.
+```dart
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 
-/invocations answers immediately and runs the leg on a background thread;
-progress is visible through /ping and the LegResult the leg writes.
-"""
-import json
-import logging
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable
+import 'busy.dart';
+import 'spec.dart';
 
-from leg_runner.busy import BusyTracker
-from leg_runner.spec import SpecError, parse_leg_spec
+const maxBodyBytes = 1024 * 1024;
 
-MAX_BODY_BYTES = 1024 * 1024
-log = logging.getLogger(__name__)
+typedef LegStarter = Future<void> Function(Map<String, Object?> spec);
 
+/// HTTP surface of the AgentCore Runtime contract: GET /ping, POST /invocations.
+///
+/// /invocations answers at once and runs the leg in the background; progress
+/// is visible through /ping and the LegResult the leg writes.
+Future<HttpServer> serve(Object address, int port, BusyTracker busy, LegStarter startLeg) async {
+  final server = await HttpServer.bind(address, port);
+  server.listen(
+    (request) {
+      _handle(request, busy, startLeg).catchError((Object error) {
+        stderr.writeln('request failed: $error');
+      });
+    },
+    // Malformed requests (e.g. a non-numeric Content-Length) surface here.
+    onError: (Object error) => stderr.writeln('connection error: $error'),
+  );
+  return server;
+}
 
-def make_server(host: str, port: int, busy: BusyTracker, start_leg: Callable[[dict], None]) -> ThreadingHTTPServer:
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == "/ping":
-                self._reply(200, busy.ping())
-            else:
-                self._reply(404, {"error": "not found"})
+Future<void> _handle(HttpRequest request, BusyTracker busy, LegStarter startLeg) async {
+  final path = request.uri.path;
+  if (request.method == 'GET' && path == '/ping') {
+    return _reply(request, 200, busy.ping());
+  }
+  if (request.method != 'POST' || path != '/invocations') {
+    return _reply(request, 404, {'error': 'not found'});
+  }
+  if (request.contentLength > maxBodyBytes) {
+    return _reply(request, 413, {'error': 'payload too large'});
+  }
+  final body = <int>[];
+  await for (final chunk in request) {
+    body.addAll(chunk);
+    if (body.length > maxBodyBytes) {
+      return _reply(request, 413, {'error': 'payload too large'});
+    }
+  }
+  final Map<String, Object?> spec;
+  try {
+    spec = parseLegSpec(body);
+  } on SpecException catch (error) {
+    return _reply(request, 400, {'error': error.message});
+  }
+  if (!busy.tryStart()) {
+    return _reply(request, 409, {'error': 'a leg is already running in this session'});
+  }
+  unawaited(startLeg(spec));
+  return _reply(request, 200, {'accepted': true, 'sessionId': spec['sessionId']});
+}
 
-        def do_POST(self):
-            if self.path != "/invocations":
-                self._reply(404, {"error": "not found"})
-                return
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                self._reply(400, {"error": "Content-Length must be an integer"})
-                return
-            if length > MAX_BODY_BYTES:
-                self._reply(413, {"error": "payload too large"})
-                return
-            try:
-                spec = parse_leg_spec(self.rfile.read(length))
-            except SpecError as error:
-                self._reply(400, {"error": str(error)})
-                return
-            if not busy.try_start():
-                self._reply(409, {"error": "a leg is already running in this session"})
-                return
-            threading.Thread(
-                target=start_leg, args=(spec,), name=f"leg-{spec['sessionId']}", daemon=True
-            ).start()
-            self._reply(200, {"accepted": True, "sessionId": spec["sessionId"]})
-
-        def _reply(self, code: int, body: dict) -> None:
-            data = json.dumps(body).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, format, *args):
-            log.info("%s %s", self.address_string(), format % args)
-
-    return ThreadingHTTPServer((host, port), Handler)
+Future<void> _reply(HttpRequest request, int status, Map<String, Object?> body) async {
+  request.response
+    ..statusCode = status
+    ..headers.contentType = ContentType.json
+    ..write(jsonEncode(body));
+  await request.response.close();
+}
 ```
 
-- [ ] **Step 5: Implement** — `leg_runner/main.py`
+- [ ] **Step 5: Implement** — `lib/src/config.dart`
 
-```python
-"""Container entrypoint: serve the AgentCore contract on 0.0.0.0:8080."""
-import logging
-import os
-from pathlib import Path
+```dart
+import 'dart:io';
 
-from leg_runner.busy import BusyTracker
-from leg_runner.job import run_leg
-from leg_runner.results import FileResultWriter, ResultWriter, S3ResultWriter
-from leg_runner.server import make_server
+import 'results.dart';
 
-
-def build_writer() -> ResultWriter:
-    local_dir = os.environ.get("LEG_RESULT_DIR")
-    if local_dir:
-        return FileResultWriter(Path(local_dir))
-    bucket = os.environ.get("LEG_RESULT_BUCKET")
-    if not bucket:
-        raise SystemExit("set LEG_RESULT_BUCKET (AgentCore) or LEG_RESULT_DIR (local)")
-    import boto3
-
-    return S3ResultWriter(bucket, boto3.client("s3"))
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    writer = build_writer()
-    busy = BusyTracker()
-    command = [os.environ.get("LEG_COMMAND", "/app/run-leg.sh")]
-    server = make_server("0.0.0.0", 8080, busy, lambda spec: run_leg(spec, writer, busy, command))
-    logging.getLogger(__name__).info("leg runner listening on 0.0.0.0:8080")
-    server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()
+/// Picks where LegResults go: a local directory (tests, contract test) or
+/// S3 through the aws CLI (AgentCore).
+ResultWriter buildWriter(Map<String, String> env) {
+  final dir = env['LEG_RESULT_DIR'];
+  if (dir != null && dir.isNotEmpty) return FileResultWriter(Directory(dir));
+  final bucket = env['LEG_RESULT_BUCKET'];
+  if (bucket != null && bucket.isNotEmpty) return AwsCliResultWriter(bucket);
+  throw StateError('set LEG_RESULT_BUCKET (AgentCore) or LEG_RESULT_DIR (local)');
+}
 ```
 
-- [ ] **Step 6: Run the whole suite**
+- [ ] **Step 6: Implement** — `bin/leg_runner.dart`
 
-Run: `uv run pytest -v`
-Expected: all tests pass (5 + 23 + 9 + 9 + 3 = 49).
+```dart
+import 'dart:io';
 
-- [ ] **Step 7: Commit**
+import 'package:leg_runner/leg_runner.dart';
+
+/// Container entrypoint: serves the AgentCore contract on 0.0.0.0:8080.
+Future<void> main() async {
+  final env = Platform.environment;
+  final writer = buildWriter(env);
+  final busy = BusyTracker();
+  final command = [env['LEG_COMMAND'] ?? '/app/run-leg.sh'];
+  await serve(InternetAddress.anyIPv4, 8080, busy, (spec) => runLeg(spec, writer, busy, command));
+  stdout.writeln('leg runner listening on 0.0.0.0:8080');
+}
+```
+
+- [ ] **Step 7: Run the whole suite and the analyzer**
 
 ```bash
-git add leg_runner/server.py leg_runner/main.py tests/test_server.py tests/test_main.py
+dart analyze --fatal-infos
+dart test
+```
+Expected: `No issues found!` and `+51: All tests passed!` (5 + 23 + 3 + 8 + 9 + 3).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add lib bin test
 git commit -m "feat: AgentCore /ping and /invocations server and entrypoint
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -993,11 +1042,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ### Task 5: Container image + hello leg + local contract test
 
 **Files:**
-- Create: `runner/run-leg.sh`, `Dockerfile`, `.dockerignore`, `requirements.lock`, `scripts/contract-test.sh`
+- Create: `runner/run-leg.sh`, `Dockerfile`, `.dockerignore`, `scripts/contract-test.sh`
 
 **Interfaces:**
-- Consumes: `python -m leg_runner.main` (Task 4).
-- Produces: image `fa-ac-leg-runner` (linux/arm64) that the deploy workflow (Task 9) builds; hello-leg payload extension `"hello": {"sleepSeconds": <int>}` used by Tasks 5 and 10.
+- Consumes: `bin/leg_runner.dart` (Task 4).
+- Produces: image `fa-ac-leg-runner` (linux/arm64, AOT-compiled Dart + aws CLI) that the deploy workflow (Task 9) builds; hello-leg payload extension `"hello": {"sleepSeconds": <int>}` used by Tasks 5 and 10.
 
 - [ ] **Step 1: Write the hello leg** — `runner/run-leg.sh`
 
@@ -1007,12 +1056,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 # file with the real factory leg (checkout, fa, push).
 set -euo pipefail
 spec="$1"
-read -r session sleep_seconds < <(python3 - "$spec" <<'PY'
-import json, sys
-spec = json.load(open(sys.argv[1]))
-print(spec["sessionId"], int(spec.get("hello", {}).get("sleepSeconds", 0)))
-PY
-)
+session="$(jq -r .sessionId "$spec")"
+sleep_seconds="$(jq -r '(.hello.sleepSeconds // 0) | floor' "$spec")"
 echo "hello leg: session=${session} sleeping ${sleep_seconds}s"
 sleep "${sleep_seconds}"
 echo "hello leg: done"
@@ -1022,47 +1067,47 @@ echo "hello leg: done"
 chmod +x runner/run-leg.sh
 ```
 
-- [ ] **Step 2: Lock runtime dependencies with hashes**
-
-```bash
-uv export --no-dev --no-emit-project --format requirements-txt > requirements.lock
-grep -c -- '--hash=sha256:' requirements.lock
-```
-Expected: a count > 0 (boto3, botocore, s3transfer, jmespath, urllib3, python-dateutil, six).
-
-- [ ] **Step 3: Write the image** — `Dockerfile` and `.dockerignore`
+- [ ] **Step 2: Write the image** — `Dockerfile` and `.dockerignore`
 
 `Dockerfile`:
 ```dockerfile
 # AgentCore Runtime requires linux/arm64 and port 8080.
-FROM --platform=linux/arm64 python:3.12-slim-bookworm
-WORKDIR /app
-COPY requirements.lock ./
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock
-COPY pyproject.toml ./
-COPY leg_runner ./leg_runner
-RUN pip install --no-cache-dir --no-deps . \
+FROM --platform=linux/arm64 dart:stable AS build
+WORKDIR /src
+COPY pubspec.yaml pubspec.lock ./
+RUN dart pub get
+COPY lib ./lib
+COPY bin ./bin
+RUN dart compile exe bin/leg_runner.dart -o /out/leg_runner
+
+FROM --platform=linux/arm64 debian:bookworm-slim
+# aws CLI: S3 uploads (Dart has no official AWS SDK). jq: the hello leg.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends awscli jq ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
  && useradd --create-home --uid 10001 runner
+COPY --from=build /out/leg_runner /app/leg_runner
 COPY --chmod=0755 runner/run-leg.sh /app/run-leg.sh
 USER runner
 EXPOSE 8080
-CMD ["python", "-m", "leg_runner.main"]
+CMD ["/app/leg_runner"]
 ```
 
 `.dockerignore`:
 ```
 .git
 .github
-.venv
-tests
+.dart_tool
+build
+test
 terraform
 docs
 scripts
-**/__pycache__
-**/*.pyc
 ```
 
-- [ ] **Step 4: Write the contract test** — `scripts/contract-test.sh`
+- [ ] **Step 3: Write the contract test** — `scripts/contract-test.sh`
+
+Dart's `jsonEncode` emits compact JSON (`"status":"Healthy"`, no spaces); the greps match that.
 
 ```bash
 #!/usr/bin/env bash
@@ -1083,16 +1128,16 @@ wait_for() {  # wait_for <seconds> <command...>
     sleep 0.2
   done
 }
-ping_is() { curl -fsS "localhost:${port}/ping" | grep -q "\"status\": \"$1\""; }
+ping_is() { curl -fsS "localhost:${port}/ping" | grep -q "\"status\":\"$1\""; }
 
 wait_for 10 ping_is Healthy
 session="contract-test-$(date +%s)-padding-to-33-chars"
 curl -fsS -X POST "localhost:${port}/invocations" -H 'Content-Type: application/json' \
   -d "{\"sessionId\":\"${session}\",\"leg\":\"hello\",\"maxSeconds\":60,\"callback\":{\"type\":\"s3\"},\"hello\":{\"sleepSeconds\":3}}" \
-  | grep -q '"accepted": true'
+  | grep -q '"accepted":true'
 ping_is HealthyBusy
 wait_for 15 test -f "${results}/legs/${session}/result.json"
-grep -q '"status": "ok"' "${results}/legs/${session}/result.json"
+grep -q '"status":"ok"' "${results}/legs/${session}/result.json"
 wait_for 5 ping_is Healthy
 echo "contract test: PASS"
 ```
@@ -1101,20 +1146,21 @@ echo "contract test: PASS"
 chmod +x scripts/contract-test.sh
 ```
 
-- [ ] **Step 5: Build and run the contract test**
+- [ ] **Step 4: Build and run the contract test**
 
 ```bash
 docker build -t fa-ac-leg-runner:local .
 docker image inspect fa-ac-leg-runner:local --format '{{.Architecture}} {{.Size}}'
+docker run --rm --entrypoint aws fa-ac-leg-runner:local --version
 scripts/contract-test.sh fa-ac-leg-runner:local
 ```
-Expected: `arm64 <size well under 2000000000>` and `contract test: PASS`.
+Expected: `arm64 <size well under 2000000000>`, an `aws-cli/…` version line, and `contract test: PASS`. If the container exits with `GLIBC_… not found`, the `dart:stable` build stage is on a newer Debian than the runtime stage: change the runtime `FROM` to the same Debian release as `dart:stable` (`docker run --rm dart:stable cat /etc/debian_version`).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add runner/run-leg.sh Dockerfile .dockerignore requirements.lock scripts/contract-test.sh
-git commit -m "feat: ARM64 leg-runner image with hello leg and local contract test
+git add runner/run-leg.sh Dockerfile .dockerignore scripts/contract-test.sh
+git commit -m "feat: ARM64 leg-runner image (AOT Dart + aws CLI) with hello leg and contract test
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2137,11 +2183,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - [ ] **Step 1: Resolve action SHAs (pin by commit, record the tag in a comment)**
 
 ```bash
-for a in actions/checkout@v4 astral-sh/setup-uv@v6 hashicorp/setup-terraform@v3 aws-actions/configure-aws-credentials@v4; do
+for a in actions/checkout@v4 hashicorp/setup-terraform@v3 aws-actions/configure-aws-credentials@v4; do
   echo "$a $(gh api repos/${a%@*}/commits/${a#*@} --jq .sha)"
 done
 ```
-Expected: four lines `<action>@<tag> <40-hex sha>`. Substitute each SHA for `<SHA:…>` below.
+Expected: three lines `<action>@<tag> <40-hex sha>`. Substitute each SHA for `<SHA:…>` below.
 
 - [ ] **Step 2: Write** — `.github/workflows/test.yml`
 
@@ -2155,13 +2201,16 @@ on:
 permissions:
   contents: read
 jobs:
-  python:
+  dart:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@<SHA:actions/checkout@v4> # v4
-      - uses: astral-sh/setup-uv@<SHA:astral-sh/setup-uv@v6> # v6
-      - run: uv sync --frozen
-      - run: uv run pytest -v
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1 (same pin as fa)
+        with:
+          sdk: stable
+      - run: dart pub get
+      - run: dart analyze --fatal-infos
+      - run: dart test
       - name: Contract test (native arm64)
         run: |
           docker build -t fa-ac-leg-runner:ci .
